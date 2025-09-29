@@ -16,11 +16,11 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/api/data", (req, res) => {
-  res.json({ message: "Hello from anupsharma backend! " });
+  res.json({ message: "Hello from anupsharma, i hope the data is displayed in backend! " });
 });
 
 app.get("/api/status", (req, res) => {
-  res.send("Anup SharmaBackend is up. Try /api/data for DB message.");
+  res.send("Anup Sharma Backend is up and running. Try /api/data for DB message.");
 });
 
 app.listen(PORT, () => {
