@@ -1,0 +1,34 @@
+# eks-cluster-config.yaml
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: fullstack-cluster
+  region: us-east-1
+  version: "1.30"
+
+iam:
+  withOIDC: true
+
+nodeGroups:
+  - name: ng-1
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 5
+    volumeSize: 20
+    ssh:
+      allow: true
+      publicKeyName: fpass  # Your existing EC2 key pair name
+    labels:
+      role: worker
+    tags:
+      # Required for cluster autoscaler
+      k8s.io/cluster-autoscaler/enabled: "true"
+      k8s.io/cluster-autoscaler/fullstack-cluster: "owned"
+
+# Enable these addons
+addons:
+- name: vpc-cni
+- name: coredns
+- name: kube-proxy
