@@ -1,8 +1,8 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline for EKS
 
 on:
   push:
-    branches: [ "main", "master" ]  # Auto-deploy to EC2
+    branches: [ "main", "master" ]  # Auto-deploy to EKS
   pull_request:
     branches: [ "main", "master", "docker" ]  # Test PRs to any branch
 
@@ -16,7 +16,9 @@ env:
   FRONTEND_IMAGE: anupsharma329/frontend
   BACKEND_IMAGE: anupsharma329/backend
   SONAR_PROJECT_KEY: anupsharma329_fullstack-react-app
-  EC2_HOST: "54.164.110.134"  # ✅ Updated to new EC2 IP
+  EKS_CLUSTER_NAME: fullstack-cluster
+  EKS_REGION: us-east-1
+  NAMESPACE: fullstack-app
 
 jobs:
   build-and-test:
@@ -186,6 +188,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64  # Multi-arch for EKS
 
       - name: Build and push Backend Docker image
         uses: docker/build-push-action@v5
@@ -199,6 +202,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64  # Multi-arch for EKS
 
       - name: Output version info
         run: |
@@ -206,66 +210,87 @@ jobs:
           echo "Backend Image: ${{ env.BACKEND_IMAGE }}:v${{ steps.version.outputs.version }}"
           echo "Semantic Version: v${{ steps.version.outputs.version }}"
 
-  deploy-to-ec2:
-    name: 🚀 Deploy to EC2 Production
+  deploy-to-eks:
+    name: 🚀 Deploy to AWS EKS
     needs: [ build-and-push-docker ]
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - name: Deploy to EC2
-        uses: appleboy/ssh-action@v1.0.3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          host: ${{ env.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          port: 22
-          timeout: 60s
-          script: |
-            echo "🚀 Starting deployment to EC2 (54.164.110.134)..."
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.EKS_REGION }}
+
+      - name: Update kubeconfig for EKS cluster
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.EKS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Verify cluster access
+        run: |
+          kubectl get nodes
+          kubectl get namespaces
+
+      - name: Deploy to EKS
+        run: |
+          echo "🚀 Starting deployment to EKS cluster: ${{ env.EKS_CLUSTER_NAME }}"
+          
+          # Create namespace if it doesn't exist
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy backend
+          echo "📦 Deploying backend..."
+          kubectl set image deployment/backend-deployment \
+            backend=${{ env.BACKEND_IMAGE }}:v${{ needs.build-and-push-docker.outputs.version }} \
+            -n ${{ env.NAMESPACE }} --record
+          
+          # Deploy frontend  
+          echo "📦 Deploying frontend..."
+          kubectl set image deployment/frontend-deployment \
+            frontend=${{ env.FRONTEND_IMAGE }}:v${{ needs.build-and-push-docker.outputs.version }} \
+            -n ${{ env.NAMESPACE }} --record
+          
+          # Wait for rollout to complete
+          echo "⏳ Waiting for deployments to complete..."
+          kubectl rollout status deployment/backend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
+          
+          # Verify services
+          echo "🔍 Verifying services..."
+          kubectl get deployments -n ${{ env.NAMESPACE }}
+          kubectl get services -n ${{ env.NAMESPACE }}
+          kubectl get ingress -n ${{ env.NAMESPACE }}
+          
+          # Get ALB URL
+          ALB_URL=$(kubectl get ingress app-ingress -n ${{ env.NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Not available yet")
+          echo "🌐 Application URL: http://$ALB_URL"
+
+      - name: Run health checks
+        run: |
+          echo "🏥 Running health checks..."
+          ALB_URL=$(kubectl get ingress app-ingress -n ${{ env.NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -n "$ALB_URL" ]; then
+            echo "Testing frontend: http://$ALB_URL"
+            curl -s -f http://$ALB_URL > /dev/null && echo "✅ Frontend is healthy" || echo "❌ Frontend health check failed"
             
-            # Create directory
-            mkdir -p ~/fullstack-app
-            cd ~/fullstack-app
-            
-            # Create docker-compose.yml
-            cat > docker-compose.yml << 'EOF'
-            version: '3.8'
-            services:
-              backend:
-                image: anupsharma329/backend:latest
-                ports:
-                  - "5001:5001"
-                restart: unless-stopped
-              frontend:
-                image: anupsharma329/frontend:latest
-                ports:
-                  - "80:80"
-                depends_on:
-                  - backend
-                restart: unless-stopped
-            EOF
-            
-            # Pull and run
-            echo "📥 Pulling latest images..."
-            docker-compose pull
-            
-            echo "🔄 Starting application..."
-            docker-compose down
-            docker-compose up -d
-            
-            echo "⏳ Waiting for services..."
-            sleep 20
-            
-            echo "🏥 Health checks..."
-            curl -s http://localhost:5001/api/data && echo "✅ Backend healthy" || echo "❌ Backend failed"
-            curl -s http://localhost && echo "✅ Frontend healthy" || echo "❌ Frontend failed"
-            
-            echo "🎉 Deployment complete!"
-            echo "🌐 Frontend: http://54.164.110.134"
-            echo "🔗 Backend: http://54.164.110.134:5001/api/data"
+            echo "Testing backend API: http://$ALB_URL/api"
+            curl -s -f http://$ALB_URL/api > /dev/null && echo "✅ Backend API is healthy" || echo "❌ Backend API health check failed"
+          else
+            echo "⚠️ ALB not ready yet, skipping external health checks"
+            # Internal health check
+            kubectl get pods -n ${{ env.NAMESPACE }} -o wide
+          fi
+
   notify:
     name: Notify Status
-    needs: [ build-and-test, sonar-analysis, build-and-push-docker, deploy-to-ec2 ]
+    needs: [ build-and-test, sonar-analysis, build-and-push-docker, deploy-to-eks ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -275,15 +300,22 @@ jobs:
         with:
           tag_prefix: ""
 
+      - name: Get ALB URL
+        id: alb
+        run: |
+          ALB_URL=$(kubectl get ingress app-ingress -n ${{ env.NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "Not available")
+          echo "ALB_URL=$ALB_URL" >> $GITHUB_OUTPUT
+
       - name: Notify Success
         if: success()
         run: |
           echo "✅ CI/CD Pipeline completed successfully!"
           echo "📦 Version: v${{ steps.version.outputs.version }}"
-          echo "🌐 Production URL: http://${{ env.EC2_HOST }}"
-          echo "🔗 Backend API: http://${{ env.EC2_HOST }}:5001/api/data"
+          echo "🌐 Production URL: http://${{ steps.alb.outputs.ALB_URL }}"
+          echo "🔗 Backend API: http://${{ steps.alb.outputs.ALB_URL }}/api"
           echo "📊 SonarQube analysis: Complete"
           echo "🐳 Docker images: Updated"
+          echo "☸️  Kubernetes: Deployed to EKS cluster '${{ env.EKS_CLUSTER_NAME }}'"
 
       - name: Notify Failure
         if: failure()
