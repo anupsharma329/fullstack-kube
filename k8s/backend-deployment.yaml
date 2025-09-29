@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: backend
-          image: anupsharma329/backend:v0.1.1
+          image: anupsharma329/backend:latest
           ports:
             - containerPort: 5001
           env:

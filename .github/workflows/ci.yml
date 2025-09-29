@@ -181,35 +181,32 @@ jobs:
         run: |
           echo "🚀 Starting deployment to EKS cluster: ${{ env.EKS_CLUSTER_NAME }}"
           
+          # Debug version
+          echo "Version from build job: '${{ needs.build-and-push-docker.outputs.version }}'"
+          
           # Create namespace if it doesn't exist
           kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
           
-          # Use the actual version from build job
+          # Force use of versioned tags (not latest)
           VERSION="${{ needs.build-and-push-docker.outputs.version }}"
-          echo "📦 Deployment version: $VERSION"
+          echo "Deploying version: $VERSION"
           
-          # Use versioned tags, fallback to latest if version is empty
-          if [ -n "$VERSION" ]; then
-            BACKEND_TAG="v$VERSION"
-            FRONTEND_TAG="v$VERSION"
-          else
-            BACKEND_TAG="latest"
-            FRONTEND_TAG="latest"
-            echo "⚠️ Version not found, using latest tags"
-          fi
-          
-          echo "📦 Deploying backend with tag: $BACKEND_TAG"
+          # Deploy backend with specific version
+          echo "📦 Deploying backend..."
           kubectl set image deployment/backend-deployment \
-            backend=${{ env.BACKEND_IMAGE }}:$BACKEND_TAG \
+            backend=${{ env.BACKEND_IMAGE }}:v$VERSION \
             -n ${{ env.NAMESPACE }}
           
-          echo "📦 Deploying frontend with tag: $FRONTEND_TAG"  
+          # Deploy frontend with specific version
+          echo "📦 Deploying frontend..."  
           kubectl set image deployment/frontend-deployment \
-            frontend=${{ env.FRONTEND_IMAGE }}:$FRONTEND_TAG \
+            frontend=${{ env.FRONTEND_IMAGE }}:v$VERSION \
             -n ${{ env.NAMESPACE }}
           
-          # Wait for rollout with better error handling and debugging
-          echo "⏳ Waiting for deployments to complete..."
+          # Wait for rollout
+          echo "⏳ Waiting for deployments..."
+          kubectl rollout status deployment/backend-deployment -n ${{ env.NAMESPACE }} --timeout=600s
+          kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=600s
           
           # Check pod status with timeout and debugging
           echo "🔍 Checking pod status..."
