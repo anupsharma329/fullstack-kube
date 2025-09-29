@@ -10,7 +10,7 @@ function App() {
       .then((json) => setData(json.message))
       .catch((err) => {
         console.error("API Error:", err);
-        setData("this is anupsharma frontend");
+        setData("This is created by anupsharma frontend");
       });
   }, []);
 

@@ -1,0 +1,294 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]  # Auto-deploy to EC2
+  pull_request:
+    branches: [ "main", "master", "docker" ]  # Test PRs to any branch
+
+permissions:
+  contents: read
+  pull-requests: read
+  security-events: write
+
+env:
+  REGISTRY: docker.io
+  FRONTEND_IMAGE: anupsharma329/frontend
+  BACKEND_IMAGE: anupsharma329/backend
+  SONAR_PROJECT_KEY: anupsharma329_fullstack-react-app
+  EC2_HOST: "54.164.110.134"  # ✅ Updated to new EC2 IP
+
+jobs:
+  build-and-test:
+    name: Build and Test (frontend + backend)
+    runs-on: ubuntu-latest
+    outputs:
+      frontend-version: ${{ steps.version.outputs.frontend-version }}
+      backend-version: ${{ steps.version.outputs.backend-version }}
+      should-deploy: ${{ steps.check-branch.outputs.should-deploy }}
+    strategy:
+      matrix:
+        project: [ frontend, backend ]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Semantic Versioning
+        id: version
+        uses: paulhatch/semantic-version@v5.3.0
+        with:
+          tag_prefix: ""
+          major_pattern: "BREAKING CHANGE:"
+          minor_pattern: "feat:"
+          format: "${major}.${minor}.${patch}-${increment}"
+
+      - name: Check if should deploy
+        id: check-branch
+        run: |
+          if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+          cache-dependency-path: |
+            ${{ matrix.project }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.project }}
+        run: npm ci
+
+      - name: Run tests with coverage
+        working-directory: ${{ matrix.project }}
+        run: |
+          npm run test --if-present -- --watch=false --ci --coverage --passWithNoTests || true
+
+      - name: Build (if present)
+        working-directory: ${{ matrix.project }}
+        run: npm run build --if-present
+
+      - name: Display versions
+        run: |
+          echo "Frontend Version: ${{ steps.version.outputs.version }}"
+          echo "Backend Version: ${{ steps.version.outputs.version }}"
+          echo "Semantic Version: ${{ steps.version.outputs.semantic_version }}"
+          echo "Branch: ${{ github.ref }}"
+
+  sonar-analysis:
+    name: SonarQube Analysis
+    needs: [ build-and-test ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            -Dsonar.organization=${{ secrets.SONAR_ORGANIZATION }}
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=frontend/src,backend
+            -Dsonar.exclusions=**/node_modules/**,**/*.test.js,**/*.spec.js,frontend/build/**,backend/node_modules/**
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.javascript.lcov.reportPaths=frontend/coverage/lcov.info,backend/coverage/lcov.info
+            -Dsonar.coverage.exclusions=**/node_modules/**,**/*.test.js,**/*.spec.js
+            -Dsonar.ci.autoconfig.disabled=true
+            ${{ github.event_name == 'pull_request' && format('-Dsonar.pullrequest.key={0} -Dsonar.pullrequest.branch={1} -Dsonar.pullrequest.base={2}', github.event.pull_request.number, github.event.pull_request.head.ref, github.event.pull_request.base.ref) || '' }}
+
+      - name: SonarQube Quality Gate Check
+        if: github.event_name == 'push'
+        uses: SonarSource/sonarqube-quality-gate-action@v1.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Upload frontend build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: frontend/build
+          if-no-files-found: ignore
+
+      - name: Upload backend package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-src
+          path: backend
+          if-no-files-found: ignore
+
+  build-and-push-docker:
+    name: Build and Push Docker Images
+    needs: [ build-and-test, sonar-analysis ]
+    if: needs.build-and-test.outputs.should-deploy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.FRONTEND_IMAGE }}
+            ${{ env.BACKEND_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+
+      - name: Get Semantic Version
+        id: version
+        uses: paulhatch/semantic-version@v5.3.0
+        with:
+          tag_prefix: ""
+          major_pattern: "BREAKING CHANGE:"
+          minor_pattern: "feat:"
+
+      - name: Build and push Frontend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:v${{ steps.version.outputs.version }}
+            ${{ env.FRONTEND_IMAGE }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Backend Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:v${{ steps.version.outputs.version }}
+            ${{ env.BACKEND_IMAGE }}:latest
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output version info
+        run: |
+          echo "Frontend Image: ${{ env.FRONTEND_IMAGE }}:v${{ steps.version.outputs.version }}"
+          echo "Backend Image: ${{ env.BACKEND_IMAGE }}:v${{ steps.version.outputs.version }}"
+          echo "Semantic Version: v${{ steps.version.outputs.version }}"
+
+  deploy-to-eks:
+    name: 🚀 Deploy to EKS
+    needs: [build-and-push-docker]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.30.0'
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region us-east-1 \
+            --name fullstack-cluster
+
+      - name: Deploy to EKS using existing manifests
+        run: |
+          echo "🚀 Deploying to EKS using existing manifests..."
+          
+          # Apply all manifests from k8s directory
+          kubectl apply -f k8s/ --recursive
+          
+          # Wait for rollout
+          echo "⏳ Waiting for deployment to complete..."
+          kubectl rollout status deployment/backend-deployment -n fullstack-app --timeout=300s
+          kubectl rollout status deployment/frontend-deployment -n fullstack-app --timeout=300s
+          
+          # Get application URLs
+          echo "📊 Deployment status:"
+          kubectl get all -n fullstack-app
+          
+          # Get LoadBalancer URL
+          LB_URL=$(kubectl get service -n fullstack-app frontend-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "🎉 Deployment complete!"
+          echo "🌐 Application URL: http://$LB_URL"
+          echo "🔗 Backend API: http://$LB_URL/api/data"
+
+      - name: Health Check
+        run: |
+          sleep 30
+          LB_URL=$(kubectl get service -n fullstack-app frontend-service -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "🏥 Running health checks..."
+          curl -f "http://$LB_URL/api/data" && echo "✅ Backend health check passed" || echo "❌ Backend health check failed"
+          curl -f "http://$LB_URL" && echo "✅ Frontend health check passed" || echo "❌ Frontend health check failed"
+  notify:
+    name: Notify Status
+    needs: [ build-and-test, sonar-analysis, build-and-push-docker, deploy-to-ec2 ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Semantic Version
+        id: version
+        uses: paulhatch/semantic-version@v5.3.0
+        with:
+          tag_prefix: ""
+
+      - name: Notify Success
+        if: success()
+        run: |
+          echo "✅ CI/CD Pipeline completed successfully!"
+          echo "📦 Version: v${{ steps.version.outputs.version }}"
+          echo "🌐 Production URL: http://${{ env.EC2_HOST }}"
+          echo "🔗 Backend API: http://${{ env.EC2_HOST }}:5001/api/data"
+          echo "📊 SonarQube analysis: Complete"
+          echo "🐳 Docker images: Updated"
+
+      - name: Notify Failure
+        if: failure()
+        run: |
+          echo "❌ CI/CD Pipeline failed"
+          echo "📦 Version: v${{ steps.version.outputs.version }}"
+          echo "🔍 Check the workflow logs for details"

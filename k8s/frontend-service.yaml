@@ -1,0 +1,15 @@
+# k8s/frontend-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+  namespace: fullstack-app
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"  # Add this for EKS
+spec:
+  selector:
+    app: frontend
+  ports:
+  - port: 80
+    targetPort: 80
+  type: LoadBalancer  # Ensure this is LoadBalancer, not ClusterIP
